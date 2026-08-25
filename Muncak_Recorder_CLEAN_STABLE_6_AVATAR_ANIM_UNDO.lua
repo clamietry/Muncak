@@ -1,0 +1,1867 @@
+--[[
+    MUNCAK RECORDER - CLEAN STABLE
+    Fokus versi ini:
+    - Record / Pause / Stop & Save
+    - Load / Play / Pause / Stop
+    - Speed 0.25x - 3x
+    - Adaptive sampling sederhana (berdasarkan gerak/rotasi)
+    - Save/load JSON via executor filesystem
+    - Compression aman saat save
+    - Teleport/respawn detection
+    - GUI compact untuk mobile
+
+    Catatan:
+    Versi ini sengaja TIDAK memakai velocity/acceleration/Hermite dulu.
+    Fondasi dibuat sederhana supaya record -> save -> load -> playback
+    stabil terlebih dahulu.
+]]
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+
+local CONFIG = {
+    Folder = "MuncakRecorder",
+    DefaultFile = "muncak_route.json",
+
+    BaseInterval = 1 / 30,
+    FastInterval = 1 / 45,
+    SlowInterval = 1 / 12,
+
+    PositionThreshold = 0.045,
+    RotationThreshold = math.rad(1.0),
+
+    CompressionPosition = 0.035,
+    CompressionRotation = math.rad(0.65),
+
+    TeleportDistance = 80,
+
+    DefaultSpeed = 1,
+    MinSpeed = 0.25,
+    MaxSpeed = 3,
+    SpeedStep = 0.25,
+
+    GuiScale = 0.82,
+
+    VelocityRecording = true,
+    VelocityInterpolation = true,
+    VelocityWeight = 0.35,
+    MaxVelocity = 250,
+
+    AccelerationRecording = true,
+    MaxAcceleration = 500,
+    CompressionAngle = math.rad(4),
+    CompressionVelocityDelta = 1.5,
+    CompressionAccelerationDelta = 8,
+    AdaptiveMinInterval = 1 / 60,
+    AdaptiveMaxInterval = 1 / 10,
+    MaxSamples = 50000,
+
+    AnimationPlayback = true,
+    AvatarHeightCompensation = true,
+    GroundRayLength = 12,
+    GroundSnapTolerance = 2.5,
+    GroundSnapMaxPerFrame = 1.25,
+}
+
+local State = {
+    Recording = false,
+    RecordPaused = false,
+
+    Playing = false,
+    PlaybackPaused = false,
+
+    RecordedPath = {},
+    LoadedPath = {},
+
+    PlaybackTime = 0,
+    PlaybackDuration = 0,
+    Speed = CONFIG.DefaultSpeed,
+
+    CurrentRoot = nil,
+    CurrentHumanoid = nil,
+    AnimationRestore = nil,
+    RecordedFootOffset = nil,
+
+    RecordToken = 0,
+    PlaybackToken = 0,
+
+    RecordStartedAt = 0,
+    RecordPausedAt = nil,
+    RecordPausedTotal = 0,
+
+    -- Safe checkpoints used by the UNDO button.
+    -- Each checkpoint is a grounded sample from the route.
+    UndoStack = {},
+    LastUndoCapture = 0,
+}
+
+-- Forward declaration: startRecording() uses this checkpoint helper.
+local pushUndoCheckpoint
+
+-- ============================================================
+-- SAFE HELPERS
+-- ============================================================
+
+local function safeTraceback(err)
+    if debug and debug.traceback then
+        return debug.traceback(tostring(err))
+    end
+    return tostring(err)
+end
+
+local function clamp(v, lo, hi)
+    return math.max(lo, math.min(hi, v))
+end
+
+local function number(v, fallback)
+    v = tonumber(v)
+    if v == nil then
+        return fallback
+    end
+    return v
+end
+
+local function safeMagnitude(v)
+    if typeof(v) == "Vector3" then
+        return v.Magnitude
+    end
+    return 0
+end
+
+local function isFiniteNumber(v)
+    v = tonumber(v)
+    return v ~= nil and v == v and v > -math.huge and v < math.huge
+end
+
+local function vecToTable(v)
+    if typeof(v) ~= "Vector3" then
+        return {x = 0, y = 0, z = 0}
+    end
+    return {x = number(v.X, 0), y = number(v.Y, 0), z = number(v.Z, 0)}
+end
+
+local function tableToVec(v)
+    if type(v) ~= "table" then
+        return Vector3.zero
+    end
+    return Vector3.new(number(v.x, 0), number(v.y, 0), number(v.z, 0))
+end
+
+local function clampVector(v, maxMagnitude)
+    if typeof(v) ~= "Vector3" then
+        return Vector3.zero
+    end
+    local magnitude = v.Magnitude
+    if not isFiniteNumber(magnitude) or magnitude <= maxMagnitude then
+        return v
+    end
+    return v.Unit * maxMagnitude
+end
+
+local function finiteVector(v)
+    if typeof(v) ~= "Vector3" then
+        return Vector3.zero
+    end
+    if not isFiniteNumber(v.X) or not isFiniteNumber(v.Y) or not isFiniteNumber(v.Z) then
+        return Vector3.zero
+    end
+    return v
+end
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+end
+
+local function getCharacterReady()
+    local character = LocalPlayer.Character
+    if not character then
+        State.CurrentRoot = nil
+        State.CurrentHumanoid = nil
+        return nil, nil
+    end
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+    if root and root:IsA("BasePart") and humanoid then
+        State.CurrentRoot = root
+        State.CurrentHumanoid = humanoid
+        return root, humanoid
+    end
+
+    State.CurrentRoot = nil
+    State.CurrentHumanoid = nil
+    return nil, nil
+end
+
+local function getAvatarFootOffset(root, humanoid)
+    if not root or not humanoid then
+        return 0
+    end
+
+    -- Roblox humanoid standing geometry:
+    -- root center -> root bottom -> feet/ground.
+    local hipHeight = number(humanoid.HipHeight, 0)
+    local halfRootHeight = root.Size.Y * 0.5
+    local offset = hipHeight + halfRootHeight
+
+    if offset <= 0 or not isFiniteNumber(offset) then
+        return root.Size.Y * 0.5
+    end
+
+    return offset
+end
+
+local function getGroundAt(position, character)
+    if not CONFIG.AvatarHeightCompensation then
+        return nil
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = character and {character} or {}
+    params.IgnoreWater = false
+
+    local origin = position + Vector3.new(0, 2.0, 0)
+    local direction = Vector3.new(0, -CONFIG.GroundRayLength, 0)
+    local hit = workspace:Raycast(origin, direction, params)
+
+    if hit and hit.Instance and hit.Instance:IsA("BasePart") then
+        return hit.Position.Y, hit
+    end
+
+    return nil
+end
+
+local function applyAvatarHeightCompensation(targetCF, root, humanoid, recordedGrounded)
+    if not CONFIG.AvatarHeightCompensation then
+        return targetCF
+    end
+
+    local character = LocalPlayer.Character
+    if not character or not root or not humanoid then
+        return targetCF
+    end
+
+    -- IMPORTANT:
+    -- Playback height is calculated from the AVATAR CURRENTLY BEING PLAYED,
+    -- never from the avatar that created the recording. The recorded
+    -- footOffset is intentionally ignored here.
+    local shouldSnap = recordedGrounded
+    if shouldSnap == nil then
+        local stateType = humanoid:GetState()
+        shouldSnap =
+            stateType ~= Enum.HumanoidStateType.Freefall
+            and stateType ~= Enum.HumanoidStateType.Jumping
+            and stateType ~= Enum.HumanoidStateType.FallingDown
+    end
+
+    if not shouldSnap then
+        return targetCF
+    end
+
+    local groundY = getGroundAt(targetCF.Position, character)
+    if groundY == nil then
+        return targetCF
+    end
+
+    -- HipHeight + current HumanoidRootPart half-height = current avatar's
+    -- root-to-feet distance. This automatically adapts to the current rig.
+    local currentFootOffset = getAvatarFootOffset(root, humanoid)
+    local desiredY = groundY + currentFootOffset
+    local deltaY = desiredY - targetCF.Position.Y
+
+    -- Do not use the recorded avatar's height and do not limit the correction
+    -- to 2.5 studs. A different R6/R15/custom avatar can have a much larger
+    -- root-to-feet difference. Grounded playback is corrected fully to the
+    -- surface detected under the current avatar.
+    if math.abs(deltaY) <= CONFIG.GroundRayLength + 2 then
+        return targetCF + Vector3.new(0, deltaY, 0)
+    end
+
+    return targetCF
+end
+
+local function findWalkAnimation(humanoid)
+    if not humanoid then
+        return nil
+    end
+
+    local character = humanoid.Parent
+    if not character then
+        return nil
+    end
+
+    local animate = character:FindFirstChild("Animate")
+    if animate then
+        -- Works with the standard Roblox Animate hierarchy:
+        -- Animate.walk.WalkAnim, plus games that rename the walk container.
+        local walkAnim = animate:FindFirstChild("WalkAnim", true)
+        if walkAnim and walkAnim:IsA("Animation") and walkAnim.AnimationId ~= "" then
+            return walkAnim.AnimationId
+        end
+
+        local walkFolder = animate:FindFirstChild("walk", true)
+        if walkFolder then
+            local candidate = walkFolder:FindFirstChildWhichIsA("Animation", true)
+            if candidate and candidate.AnimationId ~= "" then
+                return candidate.AnimationId
+            end
+        end
+    end
+
+    -- Fallback for avatars whose Animate script does not expose a walk
+    -- Animation object. These are Roblox's common default walk animations.
+    if humanoid.RigType == Enum.HumanoidRigType.R15 then
+        return "rbxassetid://507777826"
+    end
+
+    return "rbxassetid://180426354"
+end
+
+local function prepareAnimationPlayback(humanoid)
+    if not CONFIG.AnimationPlayback or not humanoid then
+        return
+    end
+
+    if not State.AnimationRestore then
+        State.AnimationRestore = {
+            AutoRotate = humanoid.AutoRotate,
+        }
+    end
+
+    humanoid.AutoRotate = false
+
+    -- Explicitly drive a walk track. Humanoid:Move() alone can fail to show
+    -- walking when the root CFrame is being manually driven every frame.
+    pcall(function()
+        local animator = humanoid:FindFirstChildOfClass("Animator")
+        if not animator then
+            animator = Instance.new("Animator")
+            animator.Parent = humanoid
+        end
+
+        local animationId = findWalkAnimation(humanoid)
+        if not animationId then
+            return
+        end
+
+        if State.AnimationTrack and State.AnimationId == animationId then
+            return
+        end
+
+        if State.AnimationTrack then
+            pcall(function()
+                State.AnimationTrack:Stop(0.12)
+                State.AnimationTrack:Destroy()
+            end)
+        end
+
+        local animation = Instance.new("Animation")
+        animation.AnimationId = animationId
+
+        local track = animator:LoadAnimation(animation)
+        track.Looped = true
+        track.Priority = Enum.AnimationPriority.Movement
+
+        State.AnimationTrack = track
+        State.AnimationId = animationId
+    end)
+end
+
+local function driveWalkAnimation(humanoid, direction, grounded)
+    if not CONFIG.AnimationPlayback or not humanoid then
+        return
+    end
+
+    local moving = grounded and direction.Magnitude > 0.03
+
+    -- Keep Humanoid movement state alive for the game's normal Animate
+    -- controller as well.
+    humanoid:Move(
+        moving and direction or Vector3.zero,
+        false
+    )
+
+    local track = State.AnimationTrack
+    if track then
+        pcall(function()
+            if moving then
+                if not track.IsPlaying then
+                    track:Play(0.10, 1, 1)
+                end
+
+                -- Playback speed follows the recorder speed so the feet do
+                -- not visibly slide too much when playback is accelerated.
+                track:AdjustSpeed(math.max(State.Speed, 0.05))
+            else
+                if track.IsPlaying then
+                    track:Stop(0.12)
+                end
+            end
+        end)
+    end
+end
+
+local function restoreAnimationPlayback()
+    local humanoid = State.CurrentHumanoid
+    if humanoid then
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+            if State.AnimationTrack and State.AnimationTrack.IsPlaying then
+                State.AnimationTrack:Stop(0.12)
+            end
+            if State.AnimationRestore then
+                humanoid.AutoRotate = State.AnimationRestore.AutoRotate
+            end
+        end)
+    end
+
+    State.AnimationTrack = nil
+    State.AnimationId = nil
+    State.AnimationRestore = nil
+end
+
+-- ============================================================
+-- CFRAME SERIALIZATION
+-- ============================================================
+
+local function serializeCFrame(cf)
+    local components = {cf:GetComponents()}
+    return components
+end
+
+local function deserializeCFrame(data)
+    if type(data) ~= "table" or #data < 12 then
+        return nil
+    end
+
+    local n = table.create(12)
+    for i = 1, 12 do
+        n[i] = tonumber(data[i])
+        if not isFiniteNumber(n[i]) then
+            return nil
+        end
+    end
+
+    return CFrame.new(
+        n[1], n[2], n[3],
+        n[4], n[5], n[6],
+        n[7], n[8], n[9],
+        n[10], n[11], n[12]
+    )
+end
+
+-- ============================================================
+-- FILESYSTEM
+-- ============================================================
+
+local FS = {}
+
+function FS.available()
+    return type(writefile) == "function"
+        and type(readfile) == "function"
+        and type(isfile) == "function"
+end
+
+function FS.ensureFolder()
+    if not FS.available() then
+        return false, "filesystem API tidak tersedia"
+    end
+
+    if type(isfolder) == "function" and isfolder(CONFIG.Folder) then
+        return true
+    end
+
+    if type(makefolder) == "function" then
+        local ok, err = pcall(makefolder, CONFIG.Folder)
+        if ok then
+            return true
+        end
+
+        -- Folder may already exist or executor may report a harmless error.
+        if type(isfolder) == "function" and isfolder(CONFIG.Folder) then
+            return true
+        end
+
+        return false, tostring(err)
+    end
+
+    -- Some executors expose writefile but not folders.
+    -- Fall back to root filename.
+    return true
+end
+
+function FS.path(filename)
+    filename = tostring(filename or "")
+    filename = filename:gsub("[/\\]", "_")
+    filename = filename:gsub("^%s+", ""):gsub("%s+$", "")
+
+    if filename == "" then
+        filename = CONFIG.DefaultFile
+    end
+
+    if not filename:lower():match("%.json$") then
+        filename = filename .. ".json"
+    end
+
+    local folderOK = FS.ensureFolder()
+    if folderOK and type(isfolder) == "function" and isfolder(CONFIG.Folder) then
+        return CONFIG.Folder .. "/" .. filename
+    end
+
+    return filename
+end
+
+function FS.write(filename, value)
+    if not FS.available() then
+        return false, "writefile/readfile/isfile tidak tersedia"
+    end
+
+    local okFolder, folderErr = FS.ensureFolder()
+    if not okFolder then
+        return false, folderErr
+    end
+
+    local path = FS.path(filename)
+
+    local okEncode, encoded = pcall(function()
+        return HttpService:JSONEncode(value)
+    end)
+
+    if not okEncode then
+        return false, "JSONEncode gagal: " .. tostring(encoded)
+    end
+
+    local okWrite, writeErr = pcall(writefile, path, encoded)
+    if not okWrite then
+        return false, "writefile gagal: " .. tostring(writeErr)
+    end
+
+    if type(isfile) == "function" and not isfile(path) then
+        return false, "file tidak terdeteksi setelah writefile"
+    end
+
+    return true, path
+end
+
+function FS.read(filename)
+    if not FS.available() then
+        return false, "filesystem API tidak tersedia"
+    end
+
+    local path = FS.path(filename)
+
+    if type(isfile) == "function" and not isfile(path) then
+        -- Also try the raw filename for executors that don't support folders.
+        if isfile(filename) then
+            path = filename
+        else
+            return false, "file tidak ditemukan: " .. path
+        end
+    end
+
+    local okRead, raw = pcall(readfile, path)
+    if not okRead then
+        return false, "readfile gagal: " .. tostring(raw)
+    end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not okDecode then
+        return false, "JSONDecode gagal: " .. tostring(decoded)
+    end
+
+    return true, decoded
+end
+
+-- ============================================================
+-- PATH VALIDATION
+-- ============================================================
+
+local function validSample(sample)
+    if type(sample) ~= "table" then
+        return false
+    end
+
+    local t = tonumber(sample.t)
+    if t == nil or t < 0 then
+        return false
+    end
+
+    return deserializeCFrame(sample.cf) ~= nil
+end
+
+local function sanitizePath(path)
+    if type(path) ~= "table" then
+        return {}
+    end
+
+    local result = {}
+    local lastT = -math.huge
+
+    for _, sample in ipairs(path) do
+        if validSample(sample) then
+            local t = tonumber(sample.t)
+
+            if t >= lastT and isFiniteNumber(t) then
+                local velocity = nil
+                if type(sample.velocity) == "table" then
+                    local vx = number(sample.velocity.x, 0)
+                    local vy = number(sample.velocity.y, 0)
+                    local vz = number(sample.velocity.z, 0)
+                    if isFiniteNumber(vx) and isFiniteNumber(vy) and isFiniteNumber(vz) then
+                        velocity = {x = vx, y = vy, z = vz}
+                    end
+                end
+
+                local acceleration = nil
+                if type(sample.acceleration) == "table" then
+                    local ax = number(sample.acceleration.x, 0)
+                    local ay = number(sample.acceleration.y, 0)
+                    local az = number(sample.acceleration.z, 0)
+                    if isFiniteNumber(ax) and isFiniteNumber(ay) and isFiniteNumber(az) then
+                        acceleration = {x = ax, y = ay, z = az}
+                    end
+                end
+
+                local grounded = nil
+                if sample.grounded ~= nil then
+                    grounded = sample.grounded == true
+                end
+
+                local footOffset = nil
+                if isFiniteNumber(sample.footOffset) and tonumber(sample.footOffset) >= 0 then
+                    footOffset = tonumber(sample.footOffset)
+                end
+
+                table.insert(result, {
+                    t = t,
+                    cf = sample.cf,
+                    velocity = velocity,
+                    acceleration = acceleration,
+                    grounded = grounded,
+                    footOffset = footOffset,
+                })
+                lastT = t
+            end
+        end
+    end
+
+    -- Normalize the first timestamp to zero. This makes files exported
+    -- by different record sessions behave identically during playback.
+    if #result > 0 then
+        local offset = result[1].t
+        if offset ~= 0 then
+            for _, sample in ipairs(result) do
+                sample.t = math.max(0, sample.t - offset)
+            end
+        end
+    end
+
+    return result
+end
+
+-- ============================================================
+-- COMPRESSION
+-- ============================================================
+
+local function rotationDifference(a, b)
+    local _, _, _, a00,a01,a02,a10,a11,a12,a20,a21,a22 = a:GetComponents()
+    local _, _, _, b00,b01,b02,b10,b11,b12,b20,b21,b22 = b:GetComponents()
+
+    local trace =
+        a00*b00 + a01*b01 + a02*b02 +
+        a10*b10 + a11*b11 + a12*b12 +
+        a20*b20 + a21*b21 + a22*b22
+
+    local value = clamp((trace - 1) / 2, -1, 1)
+    local angle = math.acos(value)
+
+    if not isFiniteNumber(angle) then
+        return 0
+    end
+
+    return angle
+end
+
+local function compressPath(path)
+    if #path <= 2 then
+        return path
+    end
+
+    local result = {path[1]}
+
+    for i = 2, #path - 1 do
+        local prev = result[#result]
+        local cur = path[i]
+        local nextSample = path[i + 1]
+
+        local a = deserializeCFrame(prev.cf)
+        local b = deserializeCFrame(cur.cf)
+        local c = deserializeCFrame(nextSample.cf)
+
+        if not a or not b or not c then
+            table.insert(result, cur)
+        else
+            local distance = safeMagnitude(b.Position - a.Position)
+            local rotation = rotationDifference(a, b)
+
+            local ab = b.Position - a.Position
+            local bc = c.Position - b.Position
+            local angle = 0
+
+            if ab.Magnitude > 0.001 and bc.Magnitude > 0.001 then
+                angle = math.acos(clamp(ab.Unit:Dot(bc.Unit), -1, 1))
+            end
+
+            local velocityDelta = 0
+            if type(prev.velocity) == "table" and type(cur.velocity) == "table" then
+                velocityDelta = safeMagnitude(tableToVec(cur.velocity) - tableToVec(prev.velocity))
+            end
+
+            local accelerationMagnitude = 0
+            if type(cur.acceleration) == "table" then
+                accelerationMagnitude = safeMagnitude(tableToVec(cur.acceleration))
+            end
+
+            local groundedChanged =
+                prev.grounded ~= cur.grounded
+                or cur.grounded ~= nextSample.grounded
+
+            local keep =
+                distance >= CONFIG.CompressionPosition
+                or rotation >= CONFIG.CompressionRotation
+                or angle >= CONFIG.CompressionAngle
+                or velocityDelta >= CONFIG.CompressionVelocityDelta
+                or accelerationMagnitude >= CONFIG.CompressionAccelerationDelta
+                or groundedChanged
+                or distance >= CONFIG.TeleportDistance
+
+            if keep then
+                table.insert(result, cur)
+            end
+        end
+    end
+
+    table.insert(result, path[#path])
+    return result
+end
+
+-- ============================================================
+-- RECORD CLOCK
+-- ============================================================
+
+local function recordTime()
+    local now = os.clock()
+
+    if State.RecordPaused and State.RecordPausedAt then
+        return State.RecordPausedAt
+            - State.RecordStartedAt
+            - State.RecordPausedTotal
+    end
+
+    return now - State.RecordStartedAt - State.RecordPausedTotal
+end
+
+local function adaptiveInterval(root, previousVelocity)
+    if not root then
+        return CONFIG.BaseInterval
+    end
+
+    local velocity = finiteVector(root.AssemblyLinearVelocity)
+    local speed = velocity.Magnitude
+    local accelerationDelta = 0
+
+    if previousVelocity and typeof(previousVelocity) == "Vector3" then
+        accelerationDelta = safeMagnitude(velocity - previousVelocity)
+    end
+
+    local speedAlpha = clamp((speed - 0.15) / (8 - 0.15), 0, 1)
+    local accelAlpha = clamp(accelerationDelta / 20, 0, 1)
+    local alpha = math.max(speedAlpha, accelAlpha)
+
+    local interval =
+        CONFIG.AdaptiveMaxInterval
+        + (CONFIG.AdaptiveMinInterval - CONFIG.AdaptiveMaxInterval) * alpha
+
+    return clamp(interval, CONFIG.AdaptiveMinInterval, CONFIG.AdaptiveMaxInterval)
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+
+local oldGui = PlayerGui:FindFirstChild("MuncakRecorderClean")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MuncakRecorderClean"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = PlayerGui
+
+local UIScale = Instance.new("UIScale")
+UIScale.Scale = CONFIG.GuiScale
+UIScale.Parent = ScreenGui
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.fromOffset(400, 455)
+Main.Position = UDim2.new(0.5, -200, 0.5, -228)
+Main.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+Main.BorderSizePixel = 0
+Main.Parent = ScreenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = Main
+
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1
+stroke.Transparency = 0.25
+stroke.Parent = Main
+
+local Padding = Instance.new("UIPadding")
+Padding.PaddingTop = UDim.new(0, 10)
+Padding.PaddingBottom = UDim.new(0, 10)
+Padding.PaddingLeft = UDim.new(0, 10)
+Padding.PaddingRight = UDim.new(0, 10)
+Padding.Parent = Main
+
+local function makeLabel(parent, text, size, position)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(235, 235, 240)
+    label.TextSize = size
+    label.Font = Enum.Font.Gotham
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Position = position
+    label.Size = UDim2.new(1, 0, 0, 22)
+    label.Parent = parent
+    return label
+end
+
+local function makeButton(parent, text, position, size)
+    local button = Instance.new("TextButton")
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(230, 230, 235)
+    button.TextSize = 14
+    button.Font = Enum.Font.GothamMedium
+    button.BackgroundColor3 = Color3.fromRGB(48, 48, 55)
+    button.BorderSizePixel = 0
+    button.Position = position
+    button.Size = size
+    button.AutoButtonColor = true
+    button.Parent = parent
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = button
+
+    return button
+end
+
+local Title = makeLabel(Main, "Muncak Recorder — Clean Stable 5", 16, UDim2.fromOffset(10, 4))
+Title.Font = Enum.Font.GothamBold
+
+local Close = makeButton(Main, "×", UDim2.new(1, -40, 0, 2), UDim2.fromOffset(30, 28))
+Close.TextSize = 18
+
+local Minimize = makeButton(Main, "—", UDim2.new(1, -75, 0, 2), UDim2.fromOffset(30, 28))
+Minimize.TextSize = 18
+
+local FileLabel = makeLabel(Main, "Filename", 12, UDim2.fromOffset(10, 43))
+
+local FileBox = Instance.new("TextBox")
+FileBox.Text = CONFIG.DefaultFile
+FileBox.PlaceholderText = "nama_file.json"
+FileBox.TextColor3 = Color3.fromRGB(235, 235, 240)
+FileBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 135)
+FileBox.TextSize = 13
+FileBox.Font = Enum.Font.Gotham
+FileBox.BackgroundColor3 = Color3.fromRGB(42, 42, 48)
+FileBox.BorderSizePixel = 0
+FileBox.Position = UDim2.fromOffset(10, 66)
+FileBox.Size = UDim2.new(1, -20, 0, 40)
+FileBox.ClearTextOnFocus = false
+FileBox.Parent = Main
+
+local fileCorner = Instance.new("UICorner")
+fileCorner.CornerRadius = UDim.new(0, 7)
+fileCorner.Parent = FileBox
+
+local RecordButton = makeButton(Main, "●  START RECORDING", UDim2.fromOffset(10, 116), UDim2.new(1, -20, 0, 42))
+local RecordPauseButton = makeButton(Main, "Ⅱ  PAUSE RECORDING", UDim2.fromOffset(10, 164), UDim2.new(1, -20, 0, 38))
+local SaveButton = makeButton(Main, "■  STOP & SAVE", UDim2.fromOffset(10, 208), UDim2.new(0.49, -5, 0, 38))
+local UndoButton = makeButton(Main, "↶  UNDO", UDim2.new(0.51, 0, 0, 208), UDim2.new(0.49, -5, 0, 38))
+
+local LoadButton = makeButton(Main, "LOAD", UDim2.fromOffset(10, 252), UDim2.new(0.32, -5, 0, 38))
+local PlayButton = makeButton(Main, "PLAY", UDim2.new(0.34, 0, 0, 252), UDim2.new(0.32, -5, 0, 38))
+local PlaybackPauseButton = makeButton(Main, "PAUSE", UDim2.new(0.68, 0, 0, 252), UDim2.new(0.32, -5, 0, 38))
+
+local StopPlaybackButton = makeButton(Main, "STOP PLAYBACK", UDim2.fromOffset(10, 296), UDim2.new(1, -20, 0, 36))
+
+local Info = makeLabel(Main, "Points: 0\nDuration: 00:00.00\nSpeed: 1.00x", 12, UDim2.fromOffset(10, 342))
+Info.Size = UDim2.new(1, -20, 0, 54)
+Info.TextYAlignment = Enum.TextYAlignment.Top
+
+local Status = makeLabel(Main, "Ready", 11, UDim2.fromOffset(10, 400))
+Status.Size = UDim2.new(1, -20, 0, 35)
+Status.TextColor3 = Color3.fromRGB(170, 170, 180)
+Status.TextWrapped = true
+
+local SpeedLabel = makeLabel(Main, "Speed: 1.00x", 11, UDim2.fromOffset(10, 432))
+SpeedLabel.Size = UDim2.new(0.55, 0, 0, 18)
+
+local SpeedDown = makeButton(Main, "−", UDim2.new(0.62, 0, 0, 428), UDim2.fromOffset(35, 24))
+local SpeedUp = makeButton(Main, "+", UDim2.new(0.74, 0, 0, 428), UDim2.fromOffset(35, 24))
+local SpeedReset = makeButton(Main, "1x", UDim2.new(0.86, 0, 0, 428), UDim2.fromOffset(45, 24))
+
+-- Dragging
+local dragging = false
+local dragStart
+local startPosition
+
+local function updateDrag(input)
+    local delta = input.Position - dragStart
+    Main.Position = UDim2.new(
+        startPosition.X.Scale,
+        startPosition.X.Offset + delta.X,
+        startPosition.Y.Scale,
+        startPosition.Y.Offset + delta.Y
+    )
+end
+
+Title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+
+        dragging = true
+        dragStart = input.Position
+        startPosition = Main.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    ) then
+        updateDrag(input)
+    end
+end)
+
+local minimized = false
+local savedSize = Main.Size
+
+Minimize.MouseButton1Click:Connect(function()
+    minimized = not minimized
+
+    for _, child in ipairs(Main:GetChildren()) do
+        if child ~= Minimize and child ~= Close and child:IsA("GuiObject") then
+            child.Visible = not minimized
+        end
+    end
+
+    Minimize.Visible = true
+    Close.Visible = true
+
+    Main.Size = minimized
+        and UDim2.fromOffset(400, 42)
+        or savedSize
+end)
+
+Close.MouseButton1Click:Connect(function()
+    State.Recording = false
+    State.Playing = false
+    State.RecordPaused = false
+    State.PlaybackPaused = false
+
+    ScreenGui:Destroy()
+end)
+
+-- ============================================================
+-- UI STATUS
+-- ============================================================
+
+local function setStatus(text)
+    if Status and Status.Parent then
+        Status.Text = tostring(text)
+    end
+end
+
+local function updateInfo()
+    local duration = 0
+
+    if State.Recording then
+        duration = math.max(recordTime(), 0)
+    elseif #State.RecordedPath > 0 then
+        duration = number(State.RecordedPath[#State.RecordedPath].t, 0)
+    elseif #State.LoadedPath > 0 then
+        duration = number(State.LoadedPath[#State.LoadedPath].t, 0)
+    end
+
+    local points = math.max(#State.RecordedPath, #State.LoadedPath)
+
+    Info.Text = string.format(
+        "Points: %d\nDuration: %02d:%05.2f\nSpeed: %.2fx\nAnim: %s | Height: %s",
+        points,
+        math.floor(duration / 60),
+        duration % 60,
+        State.Speed,
+        CONFIG.AnimationPlayback and "ON" or "OFF",
+        CONFIG.AvatarHeightCompensation and "AUTO" or "OFF"
+    )
+
+    SpeedLabel.Text = string.format("Speed: %.2fx", State.Speed)
+end
+
+-- ============================================================
+-- RECORDING
+-- ============================================================
+
+local function stopRecording(saveAfter)
+    if not State.Recording and #State.RecordedPath == 0 then
+        return
+    end
+
+    State.Recording = false
+    State.RecordPaused = false
+
+    if not saveAfter then
+        setStatus("Recording stopped")
+        return
+    end
+
+    if #State.RecordedPath == 0 then
+        setStatus("Tidak ada sample untuk disimpan")
+        return
+    end
+
+    local output = sanitizePath(State.RecordedPath)
+
+    if #output == 0 then
+        setStatus("Save gagal: tidak ada sample valid")
+        return
+    end
+
+    if #output == 1 then
+        local first = output[1]
+        table.insert(output, {
+            t = first.t + 1 / 30,
+            cf = first.cf,
+            velocity = first.velocity,
+            acceleration = first.acceleration,
+            grounded = first.grounded,
+            footOffset = first.footOffset,
+        })
+    end
+
+    output = compressPath(output)
+
+    local ok, result = FS.write(FileBox.Text, output)
+
+    if ok then
+        setStatus(string.format("Saved: %s | %d samples", tostring(result), #output))
+    else
+        setStatus("Save gagal: " .. tostring(result))
+    end
+
+    updateInfo()
+end
+
+local function startRecording()
+    if State.Recording then
+        return
+    end
+
+    if State.Playing then
+        State.Playing = false
+        State.PlaybackPaused = false
+    end
+
+    local root, humanoid = getCharacterReady()
+    if not root or not humanoid then
+        setStatus("Character/HumanoidRootPart belum siap")
+        return
+    end
+
+    State.RecordToken += 1
+    local token = State.RecordToken
+
+    State.RecordedPath = {}
+    State.UndoStack = {}
+    State.LastUndoCapture = 0
+    State.Recording = true
+    State.RecordPaused = false
+    State.RecordStartedAt = os.clock()
+    State.RecordPausedAt = nil
+    State.RecordPausedTotal = 0
+
+    -- Immediate first sample.
+    local initialVelocity = finiteVector(root.AssemblyLinearVelocity)
+    local initialGrounded = humanoid.FloorMaterial ~= Enum.Material.Air
+    State.RecordedFootOffset = getAvatarFootOffset(root, humanoid)
+
+    table.insert(State.RecordedPath, {
+        t = 0,
+        cf = serializeCFrame(root.CFrame),
+        velocity = CONFIG.VelocityRecording and vecToTable(clampVector(
+            initialVelocity,
+            CONFIG.MaxVelocity
+        )) or nil,
+        acceleration = CONFIG.AccelerationRecording and vecToTable(Vector3.zero) or nil,
+        grounded = initialGrounded,
+        footOffset = State.RecordedFootOffset,
+    })
+
+    pushUndoCheckpoint(State.RecordedPath[1])
+    State.LastUndoCapture = 0
+
+    local lastCF = root.CFrame
+    local lastVelocity = initialVelocity
+    local nextInterval = CONFIG.BaseInterval
+
+    setStatus("Recording aktif | sample 1")
+    updateInfo()
+
+    task.spawn(function()
+        local ok, err = xpcall(function()
+            while State.Recording and State.RecordToken == token do
+                if State.RecordPaused then
+                    task.wait(0.05)
+                    continue
+                end
+
+                root, humanoid = getCharacterReady()
+
+                if not root or not humanoid then
+                    task.wait(0.1)
+                    continue
+                end
+
+                local now = recordTime()
+                local cf = root.CFrame
+
+                local distance = safeMagnitude(cf.Position - lastCF.Position)
+                local rotation = rotationDifference(lastCF, cf)
+
+                -- Hard upper bound: even if the character jitters or the
+                -- executor behaves oddly, recording cannot explode in size.
+                if #State.RecordedPath >= 50000 then
+                    State.Recording = false
+                    setStatus("Recording stopped: sample limit 50,000")
+                    break
+                end
+
+                if distance >= CONFIG.PositionThreshold
+                    or rotation >= CONFIG.RotationThreshold
+                    or now - number(State.RecordedPath[#State.RecordedPath].t, 0) >= 0.20 then
+
+                    local sampleTime = math.max(
+                        now,
+                        number(State.RecordedPath[#State.RecordedPath].t, 0)
+                    )
+
+                    local currentVelocity = finiteVector(root.AssemblyLinearVelocity)
+                    local dt = math.max(
+                        sampleTime - number(State.RecordedPath[#State.RecordedPath].t, 0),
+                        1 / 240
+                    )
+
+                    local sampleVelocity = nil
+                    if CONFIG.VelocityRecording then
+                        sampleVelocity = vecToTable(clampVector(
+                            currentVelocity,
+                            CONFIG.MaxVelocity
+                        ))
+                    end
+
+                    local sampleAcceleration = nil
+                    if CONFIG.AccelerationRecording then
+                        local acceleration = (currentVelocity - lastVelocity) / dt
+                        acceleration = clampVector(
+                            finiteVector(acceleration),
+                            CONFIG.MaxAcceleration
+                        )
+                        sampleAcceleration = vecToTable(acceleration)
+                    end
+
+                    local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+                    local footOffset = getAvatarFootOffset(root, humanoid)
+
+                    table.insert(State.RecordedPath, {
+                        t = sampleTime,
+                        cf = serializeCFrame(cf),
+                        velocity = sampleVelocity,
+                        acceleration = sampleAcceleration,
+                        grounded = grounded,
+                        footOffset = footOffset,
+                    })
+
+                    -- Grounded samples become safe UNDO checkpoints.
+                    if grounded then
+                        pushUndoCheckpoint(State.RecordedPath[#State.RecordedPath])
+                        State.LastUndoCapture = sampleTime
+                    end
+
+                    lastCF = cf
+                    lastVelocity = currentVelocity
+                    nextInterval = adaptiveInterval(root, currentVelocity)
+
+                    updateInfo()
+                end
+
+                task.wait(clamp(nextInterval * 0.5, 1 / 120, 1 / 20))
+            end
+        end, safeTraceback)
+
+        if not ok and State.RecordToken == token then
+            State.Recording = false
+            State.RecordPaused = false
+            setStatus("Recording error: " .. tostring(err):sub(1, 220))
+        end
+    end)
+end
+
+-- ============================================================
+-- UNDO / SAFE CHECKPOINTS
+-- ============================================================
+
+local function sampleToCFrame(sample)
+    if type(sample) ~= "table" then
+        return nil
+    end
+    return deserializeCFrame(sample.cf)
+end
+
+function pushUndoCheckpoint(sample)
+    if type(sample) ~= "table" or sample.grounded ~= true then
+        return
+    end
+
+    local t = number(sample.t, 0)
+    local cf = sampleToCFrame(sample)
+    if not cf then
+        return
+    end
+
+    -- Avoid filling the stack with nearly identical grounded samples.
+    local last = State.UndoStack[#State.UndoStack]
+    if last then
+        local lastCF = sampleToCFrame(last)
+        local lastT = number(last.t, 0)
+        if lastCF and (cf.Position - lastCF.Position).Magnitude < 1.0 and math.abs(t - lastT) < 0.5 then
+            return
+        end
+    end
+
+    table.insert(State.UndoStack, {
+        t = t,
+        cf = sample.cf,
+        velocity = sample.velocity,
+        acceleration = sample.acceleration,
+        grounded = true,
+        footOffset = sample.footOffset,
+    })
+end
+
+local function rebuildUndoStack(path)
+    State.UndoStack = {}
+    State.LastUndoCapture = 0
+
+    if type(path) ~= "table" then
+        return
+    end
+
+    for _, sample in ipairs(path) do
+        pushUndoCheckpoint(sample)
+    end
+end
+
+local function findUndoCheckpoint(path)
+    local root = getRoot()
+    if not root or type(path) ~= "table" or #path == 0 then
+        return nil, nil
+    end
+
+    local currentPos = root.Position
+    local nearestIndex = 1
+    local nearestDistance = math.huge
+
+    -- First find the route sample closest to the player's current position.
+    for i, sample in ipairs(path) do
+        local cf = sampleToCFrame(sample)
+        if cf then
+            local d = (cf.Position - currentPos).Magnitude
+            if d < nearestDistance then
+                nearestDistance = d
+                nearestIndex = i
+            end
+        end
+    end
+
+    -- Then walk backwards until we find the last safe/grounded point.
+    -- This is exactly what we want after falling from an obstacle:
+    -- the airborne/fall samples are skipped and the previous ground point wins.
+    -- If the player is already standing on a checkpoint, skip that checkpoint
+    -- so pressing UNDO again really behaves like a second undo.
+    local nearestCF = sampleToCFrame(path[nearestIndex])
+    local startIndex = nearestIndex
+    if nearestCF and (nearestCF.Position - currentPos).Magnitude < 1.5 then
+        startIndex = nearestIndex - 1
+    end
+
+    for i = startIndex, 1, -1 do
+        local sample = path[i]
+        if sample and sample.grounded == true then
+            local cf = sampleToCFrame(sample)
+            if cf then
+                return i, sample
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function truncatePathAt(path, index)
+    if type(path) ~= "table" or not index then
+        return
+    end
+
+    for i = #path, index + 1, -1 do
+        table.remove(path, i)
+    end
+end
+
+local function undoToSafePoint()
+    local root, humanoid = getCharacterReady()
+    if not root then
+        setStatus("UNDO gagal: character belum siap")
+        return
+    end
+
+    -- Prefer the path currently being recorded. Otherwise use the loaded path.
+    local path
+    local isRecordingPath = false
+
+    if #State.RecordedPath > 0 then
+        path = State.RecordedPath
+        isRecordingPath = State.Recording
+    elseif #State.LoadedPath > 0 then
+        path = State.LoadedPath
+    else
+        setStatus("UNDO: belum ada route")
+        return
+    end
+
+    local index, checkpoint = findUndoCheckpoint(path)
+    if not index or not checkpoint then
+        setStatus("UNDO: tidak menemukan titik aman")
+        return
+    end
+
+    local cf = sampleToCFrame(checkpoint)
+    if not cf then
+        setStatus("UNDO: checkpoint tidak valid")
+        return
+    end
+
+    -- Stop active playback first so its loop cannot immediately overwrite
+    -- the teleport made by UNDO.
+    if State.Playing then
+        State.Playing = false
+        State.PlaybackPaused = false
+        State.PlaybackToken += 1
+        restoreAnimationPlayback()
+    end
+
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.CFrame = cf
+
+    if isRecordingPath then
+        -- Remove the failed section from the recording. Recording continues
+        -- from the recovered checkpoint instead of saving the fall.
+        truncatePathAt(State.RecordedPath, index)
+        State.UndoStack = {}
+        rebuildUndoStack(State.RecordedPath)
+        State.LastUndoCapture = number(checkpoint.t, 0)
+    end
+
+    setStatus(string.format("↶ UNDO → checkpoint %.2fs", number(checkpoint.t, 0)))
+    updateInfo()
+end
+
+local function toggleRecordPause()
+    if not State.Recording then
+        return
+    end
+
+    if State.RecordPaused then
+        local now = os.clock()
+
+        if State.RecordPausedAt then
+            State.RecordPausedTotal += now - State.RecordPausedAt
+        end
+
+        State.RecordPausedAt = nil
+        State.RecordPaused = false
+
+        setStatus("Recording resumed")
+    else
+        State.RecordPausedAt = os.clock()
+        State.RecordPaused = true
+
+        setStatus("Recording paused")
+    end
+end
+
+-- ============================================================
+-- PLAYBACK
+-- ============================================================
+
+local function findSegment(path, time)
+    if #path < 2 then
+        return nil
+    end
+
+    if time <= path[1].t then
+        return 1
+    end
+
+    if time >= path[#path].t then
+        return #path - 1
+    end
+
+    local low = 1
+    local high = #path - 1
+
+    while low <= high do
+        local mid = math.floor((low + high) / 2)
+
+        local a = number(path[mid].t, nil)
+        local b = number(path[mid + 1].t, nil)
+
+        if a == nil or b == nil then
+            return nil
+        end
+
+        if time < a then
+            high = mid - 1
+        elseif time > b then
+            low = mid + 1
+        else
+            return mid
+        end
+    end
+
+    return clamp(low, 1, #path - 1)
+end
+
+local function estimateVelocity(sampleA, sampleB)
+    if sampleA and type(sampleA.velocity) == "table" then
+        return tableToVec(sampleA.velocity)
+    end
+
+    if sampleA and sampleB then
+        local a = deserializeCFrame(sampleA.cf)
+        local b = deserializeCFrame(sampleB.cf)
+        local ta = number(sampleA.t, 0)
+        local tb = number(sampleB.t, ta + 1 / 30)
+        local dt = math.max(tb - ta, 1 / 240)
+
+        if a and b then
+            return clampVector((b.Position - a.Position) / dt, CONFIG.MaxVelocity)
+        end
+    end
+
+    return Vector3.zero
+end
+
+local function velocityHermitePosition(p0, p1, v0, v1, alpha, dt)
+    local t = clamp(alpha, 0, 1)
+    local t2 = t * t
+    local t3 = t2 * t
+
+    local h00 = 2*t3 - 3*t2 + 1
+    local h10 = t3 - 2*t2 + t
+    local h01 = -2*t3 + 3*t2
+    local h11 = t3 - t2
+
+    return h00 * p0 + h10 * v0 * dt + h01 * p1 + h11 * v1 * dt
+end
+
+local function interpolateCFrame(a, b, alpha, sampleA, sampleB, duration)
+    alpha = clamp(alpha, 0, 1)
+    local linear = a:Lerp(b, alpha)
+
+    if not CONFIG.VelocityInterpolation
+        or not CONFIG.VelocityRecording
+        or duration <= 0 then
+        return linear
+    end
+
+    local v0 = clampVector(estimateVelocity(sampleA, sampleB), CONFIG.MaxVelocity)
+    local v1 = clampVector(estimateVelocity(sampleB, nil), CONFIG.MaxVelocity)
+
+    local hermitePosition = velocityHermitePosition(
+        a.Position,
+        b.Position,
+        v0 * CONFIG.VelocityWeight,
+        v1 * CONFIG.VelocityWeight,
+        alpha,
+        duration
+    )
+
+    local position = linear.Position:Lerp(hermitePosition, CONFIG.VelocityWeight)
+    local rotationOnly = a.Rotation:Lerp(b.Rotation, alpha)
+
+    return CFrame.new(position) * rotationOnly
+end
+
+local function stopPlayback()
+    State.Playing = false
+    State.PlaybackPaused = false
+    State.PlaybackToken += 1
+    restoreAnimationPlayback()
+    setStatus("Playback stopped")
+end
+
+local function playLoadedPath()
+    if State.Playing then
+        return
+    end
+
+    local path = State.LoadedPath
+
+    if #path == 0 and #State.RecordedPath >= 2 then
+        path = sanitizePath(State.RecordedPath)
+    end
+
+    if #path < 2 then
+        setStatus("Playback gagal: load path minimal 2 sample")
+        return
+    end
+
+    local root, humanoid = getCharacterReady()
+    if not root or not humanoid then
+        setStatus("Character/HumanoidRootPart/Humanoid belum siap")
+        return
+    end
+
+    prepareAnimationPlayback(humanoid)
+
+    State.PlaybackToken += 1
+    local token = State.PlaybackToken
+
+    State.Playing = true
+    State.PlaybackPaused = false
+    State.PlaybackTime = 0
+    State.PlaybackDuration = number(path[#path].t, 0)
+
+    setStatus("Playback aktif")
+    updateInfo()
+
+    task.spawn(function()
+        local ok, err = xpcall(function()
+            local last = os.clock()
+
+            while State.Playing and State.PlaybackToken == token do
+                if State.PlaybackPaused then
+                    last = os.clock()
+                    task.wait(0.05)
+                    continue
+                end
+
+                local now = os.clock()
+                local dt = clamp(now - last, 0, 0.10)
+                last = now
+
+                State.PlaybackTime += dt * State.Speed
+
+                if State.PlaybackTime >= State.PlaybackDuration then
+                    State.PlaybackTime = State.PlaybackDuration
+                end
+
+                local index = findSegment(path, State.PlaybackTime)
+
+                if not index then
+                    setStatus("Playback error: invalid timeline")
+                    break
+                end
+
+                local sampleA = path[index]
+                local sampleB = path[index + 1]
+
+                local cfA = deserializeCFrame(sampleA.cf)
+                local cfB = deserializeCFrame(sampleB.cf)
+
+                if not cfA or not cfB then
+                    setStatus("Playback error: CFrame sample invalid")
+                    break
+                end
+
+                local ta = number(sampleA.t, 0)
+                local tb = number(sampleB.t, ta + 1 / 30)
+                local duration = math.max(tb - ta, 1 / 240)
+
+                local alpha = clamp(
+                    (State.PlaybackTime - ta) / duration,
+                    0,
+                    1
+                )
+
+                root, humanoid = getCharacterReady()
+                if not root or not humanoid then
+                    setStatus("Playback berhenti: character tidak siap")
+                    break
+                end
+
+                local distance = safeMagnitude(cfB.Position - cfA.Position)
+
+                local targetCF
+                if distance >= CONFIG.TeleportDistance then
+                    -- Don't animate a real teleport.
+                    targetCF = alpha >= 0.999999 and cfB or cfA
+                else
+                    targetCF = interpolateCFrame(
+                        cfA,
+                        cfB,
+                        alpha,
+                        sampleA,
+                        sampleB,
+                        duration
+                    )
+                end
+
+                -- Drive Roblox's default Animate controller instead of
+                -- leaving the humanoid in an idle pose while we move its root.
+                -- Use the interpolated target movement for animation rather
+                -- than only the raw sample-to-sample delta. This keeps walking
+                -- active on compressed recordings too.
+                local moveDelta = cfB.Position - cfA.Position
+                local horizontal = Vector3.new(moveDelta.X, 0, moveDelta.Z)
+                local grounded =
+                    sampleA.grounded == true
+                    or sampleB.grounded == true
+
+                -- If the current avatar has just respawned/changed rig,
+                -- rebuild the animation track for that avatar.
+                if not State.AnimationTrack then
+                    prepareAnimationPlayback(humanoid)
+                end
+
+                driveWalkAnimation(
+                    humanoid,
+                    horizontal.Magnitude > 0.001 and horizontal.Unit or Vector3.zero,
+                    grounded
+                )
+
+                targetCF = applyAvatarHeightCompensation(
+                    targetCF,
+                    root,
+                    humanoid,
+                    grounded
+                )
+
+                root.CFrame = targetCF
+
+                updateInfo()
+
+                if State.PlaybackTime >= State.PlaybackDuration then
+                    break
+                end
+
+                RunService.Heartbeat:Wait()
+            end
+        end, safeTraceback)
+
+        if State.PlaybackToken == token then
+            State.Playing = false
+            State.PlaybackPaused = false
+            restoreAnimationPlayback()
+
+            if not ok then
+                setStatus("Playback error: " .. tostring(err):sub(1, 220))
+            else
+                setStatus("Playback selesai")
+            end
+        end
+    end)
+end
+
+local function togglePlaybackPause()
+    if not State.Playing then
+        return
+    end
+
+    State.PlaybackPaused = not State.PlaybackPaused
+
+    if State.PlaybackPaused then
+        setStatus("Playback paused")
+    else
+        setStatus("Playback resumed")
+    end
+end
+
+-- ============================================================
+-- LOAD
+-- ============================================================
+
+local function loadPath()
+    local ok, data = FS.read(FileBox.Text)
+
+    if not ok then
+        setStatus("Load gagal: " .. tostring(data))
+        return
+    end
+
+    local path = sanitizePath(data)
+
+    if #path < 2 then
+        setStatus("Load gagal: file tidak punya minimal 2 sample valid")
+        return
+    end
+
+    State.LoadedPath = path
+    rebuildUndoStack(State.LoadedPath)
+    State.PlaybackTime = 0
+    State.PlaybackDuration = number(path[#path].t, 0)
+
+    setStatus(string.format("Loaded | %d samples | %.2fs | velocity + acceleration ready", #path, State.PlaybackDuration))
+    updateInfo()
+end
+
+-- ============================================================
+-- SPEED
+-- ============================================================
+
+local function changeSpeed(delta)
+    State.Speed = clamp(
+        math.round((State.Speed + delta) / CONFIG.SpeedStep) * CONFIG.SpeedStep,
+        CONFIG.MinSpeed,
+        CONFIG.MaxSpeed
+    )
+
+    updateInfo()
+end
+
+SpeedDown.MouseButton1Click:Connect(function()
+    changeSpeed(-CONFIG.SpeedStep)
+end)
+
+SpeedUp.MouseButton1Click:Connect(function()
+    changeSpeed(CONFIG.SpeedStep)
+end)
+
+SpeedReset.MouseButton1Click:Connect(function()
+    State.Speed = CONFIG.DefaultSpeed
+    updateInfo()
+end)
+
+-- Lightweight UI refresh independent from recorder/playback loops.
+task.spawn(function()
+    while ScreenGui.Parent do
+        updateInfo()
+        task.wait(0.20)
+    end
+end)
+
+-- ============================================================
+-- BUTTONS
+-- ============================================================
+
+RecordButton.MouseButton1Click:Connect(function()
+    startRecording()
+end)
+
+RecordPauseButton.MouseButton1Click:Connect(function()
+    toggleRecordPause()
+end)
+
+SaveButton.MouseButton1Click:Connect(function()
+    stopRecording(true)
+end)
+
+UndoButton.MouseButton1Click:Connect(undoToSafePoint)
+
+LoadButton.MouseButton1Click:Connect(function()
+    loadPath()
+end)
+
+PlayButton.MouseButton1Click:Connect(function()
+    playLoadedPath()
+end)
+
+PlaybackPauseButton.MouseButton1Click:Connect(function()
+    togglePlaybackPause()
+end)
+
+StopPlaybackButton.MouseButton1Click:Connect(function()
+    stopPlayback()
+end)
+
+-- ============================================================
+-- CLEANUP / CHARACTER RESPAWN
+-- ============================================================
+
+LocalPlayer.CharacterAdded:Connect(function()
+    State.CurrentRoot = nil
+    State.CurrentHumanoid = nil
+    State.AnimationRestore = nil
+
+    if State.Playing then
+        stopPlayback()
+        setStatus("Playback dihentikan: character respawn")
+    end
+end)
+
+-- ============================================================
+-- INITIAL STATUS
+-- ============================================================
+
+if not FS.available() then
+    setStatus("Warning: filesystem executor API tidak tersedia")
+else
+    local okFolder, folderErr = FS.ensureFolder()
+
+    if okFolder then
+        setStatus("Ready | folder: " .. CONFIG.Folder)
+    else
+        setStatus("Ready | filesystem: " .. tostring(folderErr))
+    end
+end
+
+updateInfo()
+
+print("[Muncak Recorder] CLEAN STABLE 5 loaded")
